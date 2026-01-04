@@ -8,7 +8,7 @@ import csv
 import yfinance as yf
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Stacked Dashboard", page_icon= "🥞:", layout="wide")
+st.set_page_config(page_title="Stacked Dashboard", page_icon= "🥞", layout="wide")
 
 # --- CONSTANTS ---
 PRIMARY_GREEN = '#2ECC71'    # Growth / Profit
