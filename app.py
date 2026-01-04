@@ -8,7 +8,7 @@ import csv
 import yfinance as yf
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Stacked Dashboard", layout="wide")
+st.set_page_config(page_title="Stacked Dashboard", page_icon= "🥞:", layout="wide")
 
 # --- CONSTANTS ---
 PRIMARY_GREEN = '#2ECC71'    # Growth / Profit
@@ -411,7 +411,7 @@ if 'demo_active' not in st.session_state:
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
 
-st.title("Stacked: Investment Dashboard")
+st.title("🥞Stacked: Investment Dashboard")
 
 # Initialize FX
 usd_cad_rate = get_exchange_rate()
