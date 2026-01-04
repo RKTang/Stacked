@@ -17,11 +17,11 @@ DANGER_RED = '#E74C3C'       # Loss
 NEUTRAL_GREY = '#7F8C8D'     # Invested Line
 CATEGORY_COLORS = ['#F1C40F', '#95A5A6', '#3498DB', '#2ECC71', '#E67E22', '#9B59B6']
 
-# Context for benchmarks
+# Context for benchmarks (Added Currency Info)
 BENCHMARK_CONTEXT = {
-    "S&P 500": "Tracks the 500 largest companies in the US. The standard benchmark for overall market performance.",
-    "Nasdaq-100": "Tracks the 100 largest non-financial companies on Nasdaq. Heavily weighted towards Technology and Growth.",
-    "TSX Composite (Canada)": "Tracks the largest companies on the Toronto Stock Exchange. Represents the broad Canadian market (Banks, Energy, Mining)."
+    "S&P 500": {"ticker": "^GSPC", "currency": "USD", "desc": "US Large Cap (USD)"},
+    "Nasdaq-100": {"ticker": "^IXIC", "currency": "USD", "desc": "Tech Heavy (USD)"},
+    "TSX Composite (Canada)": {"ticker": "^GSPTSE", "currency": "CAD", "desc": "Canadian Market (CAD)"}
 }
 
 # Hardcoded Historical Data (Fallback)
@@ -38,6 +38,19 @@ FALLBACK_DATES = pd.date_range(start='2021-01-01', periods=len(REAL_SP500_DATA),
 FALLBACK_BENCH_MAP = dict(zip(FALLBACK_DATES, REAL_SP500_DATA))
 
 # --- 1. DATA PROCESSING FUNCTIONS ---
+
+@st.cache_data
+def get_exchange_rate():
+    """Fetches USD to CAD rate (CAD=X). Returns 1.40 as fallback."""
+    try:
+        # Get CAD=X (amount of CAD for 1 USD)
+        ticker = yf.Ticker("CAD=X")
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return hist['Close'].iloc[-1]
+        return 1.40
+    except:
+        return 1.40
 
 @st.cache_data
 def get_benchmark_data(ticker_symbol, start_date):
@@ -139,159 +152,258 @@ def generate_example_data():
             
     return pd.DataFrame(all_records)
 
-# --- 2. VISUALIZATION ENGINE ---
+# --- 2. MONTE CARLO SIMULATOR ---
 
-def render_dashboard(df, bench_ticker, bench_name):
+def run_monte_carlo(current_val, monthly_add, years, mean_ret_pct, vol_pct, num_sims=500):
+    """Generates future portfolio paths based on geometric brownian motion."""
+    months = int(years * 12)
+    mu = mean_ret_pct / 12  # Monthly return
+    sigma = vol_pct / np.sqrt(12) # Monthly volatility
+    
+    # Random shocks: matrix of shape [months, num_sims]
+    shocks = np.random.normal(mu - 0.5 * sigma**2, sigma, (months, num_sims))
+    
+    # Initialize paths
+    paths = np.zeros((months + 1, num_sims))
+    paths[0] = current_val
+    
+    for t in range(1, months + 1):
+        # Growth step
+        growth = np.exp(shocks[t-1])
+        paths[t] = paths[t-1] * growth
+        # Contribution step
+        paths[t] += monthly_add
+        
+    return paths
+
+# --- 3. VISUALIZATION ENGINE ---
+
+def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
     if df.empty:
         st.warning("No data available to render.")
         return
 
-    # A. Aggregate Data
-    df_total = df.groupby('Date')[['Value', 'BookCost']].sum().reset_index()
-    unique_types = sorted(df['Type'].unique())
+    # --- CURRENCY NORMALIZATION LOGIC ---
+    # 1. Determine User Conversion Factors (Assuming User Data is CAD)
+    user_fx_multiplier = 1.0
+    if target_currency == "USD":
+        user_fx_multiplier = 1.0 / usd_cad_rate
+
+    # 2. Benchmark FX Logic
+    bench_currency = bench_info['currency']
+    bench_fx_multiplier = 1.0
+    
+    if bench_currency == "USD" and target_currency == "CAD":
+        bench_fx_multiplier = usd_cad_rate
+    elif bench_currency == "CAD" and target_currency == "USD":
+        bench_fx_multiplier = 1.0 / usd_cad_rate
+
+    # 3. Apply Conversion to Data
+    df_conv = df.copy()
+    df_conv['Value'] = df_conv['Value'] * user_fx_multiplier
+    df_conv['BookCost'] = df_conv['BookCost'] * user_fx_multiplier
+
+    # --- AGGREGATION ---
+    df_total = df_conv.groupby('Date')[['Value', 'BookCost']].sum().reset_index()
+    unique_types = sorted(df_conv['Type'].unique())
     color_map = {t: CATEGORY_COLORS[i % len(CATEGORY_COLORS)] for i, t in enumerate(unique_types)}
     
-    # B. Benchmark Calculation
-    bench_data = get_benchmark_data(bench_ticker, df_total['Date'].min())
-    df_total['Incr_Invest'] = df_total['BookCost'].diff().fillna(df_total['BookCost'].iloc[0])
+    # --- BENCHMARK CALCULATION ---
+    bench_data_raw = get_benchmark_data(bench_info['ticker'], df_total['Date'].min())
     
     bench_units = 0
     bench_values = []
-    # Fallback price if data missing
-    first_price = next(iter(bench_data.values())) if bench_data else 100.0
+    # Get first available price or default
+    first_date_match = next(iter(bench_data_raw))
+    first_price_raw = bench_data_raw.get(first_date_match, 100.0)
+    
+    df_total['Incr_Invest'] = df_total['BookCost'].diff().fillna(df_total['BookCost'].iloc[0])
     
     for _, row in df_total.iterrows():
-        match_date = row['Date'].replace(day=1)
-        price = bench_data.get(match_date, first_price)
-        bench_units += row['Incr_Invest'] / price
-        bench_values.append(bench_units * price)
+        match_date = row['Date'].replace(day=1) # normalize to start of month
+        # Get raw price and apply FX
+        raw_price = bench_data_raw.get(match_date, first_price_raw)
+        adj_price = raw_price * bench_fx_multiplier
+        
+        bench_units += row['Incr_Invest'] / adj_price
+        bench_values.append(bench_units * adj_price)
     
     df_total['BenchValue'] = bench_values
     latest = df_total.iloc[-1]
     
-    # C. KPI Calculations
+    # --- KPI Calculations ---
     u_roi = (latest['Value'] / latest['BookCost'] - 1) * 100 if latest['BookCost'] > 0 else 0
     b_roi = (latest['BenchValue'] / latest['BookCost'] - 1) * 100 if latest['BookCost'] > 0 else 0
 
-    # --- RENDER UI ---
-    
-    # 1. Metric Row
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Net Worth", f"${latest['Value']:,.2f}")
-    c2.metric("Total Invested", f"${latest['BookCost']:,.2f}")
-    c3.metric("My ROI", f"{u_roi:.2f}%")
-    c4.metric(f"{bench_name} ROI", f"{b_roi:.2f}%", delta=f"{(u_roi - b_roi):.2f}% vs Market")
+    # --- TABS LAYOUT ---
+    tab1, tab2 = st.tabs(["Portfolio Performance", "Future Simulator (FIRE)"])
 
-    st.markdown("---")
+    # --- TAB 1: HISTORY ---
+    with tab1:
+        # 1. Metric Row
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(f"Net Worth ({target_currency})", f"${latest['Value']:,.2f}")
+        c2.metric("Total Invested", f"${latest['BookCost']:,.2f}")
+        c3.metric("My ROI", f"{u_roi:.2f}%")
+        c4.metric(f"{bench_key} ROI", f"{b_roi:.2f}%", delta=f"{(u_roi - b_roi):.2f}% vs Market")
 
-    # 2. Chart: Net Worth vs Invested
-    st.subheader("Net Worth vs. Invested (Capital Growth)")
-    fig_net = go.Figure()
-    fig_net.add_trace(go.Scatter(
-        x=df_total['Date'], y=df_total['BookCost'], 
-        mode='lines', name='Invested', 
-        line=dict(color=NEUTRAL_GREY, dash='dash'), 
-        hovertemplate='Invested: $%{y:,.2f}'
-    ))
-    fig_net.add_trace(go.Scatter(
-        x=df_total['Date'], y=df_total['Value'], 
-        mode='lines', name='Net Worth', 
-        fill='tonexty', line=dict(color=PRIMARY_GREEN), 
-        hovertemplate='Value: $%{y:,.2f}'
-    ))
-    fig_net.update_layout(
-        hovermode="x unified", template="plotly_white", height=400, 
-        yaxis_tickprefix="$", yaxis_tickformat=",.2f"
-    )
-    st.plotly_chart(fig_net, use_container_width=True)
+        st.markdown("---")
 
-    # 3. Chart: Benchmark Comparison (WITH CONTEXT)
-    st.subheader(f"Portfolio vs. {bench_name} (Value Comparison)")
-    
-    # --- ADDED CONTEXT SECTION ---
-    st.info(f"""
-    **Strategy Comparison:** Active (Your Portfolio) vs. Passive ({bench_name})
-    
-    This simulation answers the question: *'What if I had invested every dollar into the {bench_name} instead?'*
-    It helps you calculate the **opportunity cost** of your specific stock picks and timing.
-    """)
-    # -----------------------------
-
-    fig_bench = go.Figure()
-    fig_bench.add_trace(go.Scatter(
-        x=df_total['Date'], y=df_total['BenchValue'], 
-        name=bench_name, 
-        line=dict(color=BENCHMARK_ORANGE, width=2), 
-        hovertemplate=f'{bench_name}: '+'$%{y:,.2f}'
-    ))
-    fig_bench.add_trace(go.Scatter(
-        x=df_total['Date'], y=df_total['Value'], 
-        name='My Portfolio', 
-        line=dict(color=PRIMARY_GREEN, width=3), 
-        hovertemplate='My Portfolio: $%{y:,.2f}'
-    ))
-    fig_bench.update_layout(
-        hovermode="x unified", template="plotly_white", height=400, 
-        yaxis_tickprefix="$", yaxis_tickformat=",.2f"
-    )
-    st.plotly_chart(fig_bench, use_container_width=True)
-
-    # 4. Charts: Composition & Returns
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.subheader("Portfolio Composition")
-        fig_comp = px.area(
-            df.groupby(['Date', 'Type'])['Value'].sum().reset_index(), 
-            x="Date", y="Value", color="Type", 
-            color_discrete_map=color_map
-        )
-        fig_comp.update_layout(
-            hovermode="x unified", template="plotly_white", 
-            yaxis_tickprefix="$", yaxis_tickformat=",.2f"
-        )
-        fig_comp.update_traces(hovertemplate='$%{y:,.2f}')
-        st.plotly_chart(fig_comp, use_container_width=True)
-
-    with col_b:
-        st.subheader("Monthly Market Gain ($)")
-        df_total['TotalDiff'] = df_total['Value'].diff().fillna(0)
-        df_total['Contribution'] = df_total['BookCost'].diff().fillna(0)
-        df_total['MarketGain'] = df_total['TotalDiff'] - df_total['Contribution']
-        df_total['BarColor'] = df_total['MarketGain'].apply(lambda x: PRIMARY_GREEN if x >= 0 else DANGER_RED)
-        
-        fig_bar = go.Figure(go.Bar(
-            x=df_total['Date'], y=df_total['MarketGain'], 
-            marker_color=df_total['BarColor'], 
-            hovertemplate='Gain: $%{y:,.2f}<extra></extra>'
+        # 2. Chart: Net Worth vs Invested
+        st.subheader("Net Worth vs. Invested (Capital Growth)")
+        fig_net = go.Figure()
+        fig_net.add_trace(go.Scatter(
+            x=df_total['Date'], y=df_total['BookCost'], 
+            mode='lines', name='Invested', 
+            line=dict(color=NEUTRAL_GREY, dash='dash'), 
+            hovertemplate='Invested: $%{y:,.2f}'
         ))
-        fig_bar.update_layout(
-            template="plotly_white", 
+        fig_net.add_trace(go.Scatter(
+            x=df_total['Date'], y=df_total['Value'], 
+            mode='lines', name='Net Worth', 
+            fill='tonexty', line=dict(color=PRIMARY_GREEN), 
+            hovertemplate='Value: $%{y:,.2f}'
+        ))
+        fig_net.update_layout(
+            hovermode="x unified", template="plotly_white", height=400, 
             yaxis_tickprefix="$", yaxis_tickformat=",.2f"
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_net, use_container_width=True)
 
-    # 5. Chart: Allocation Donut
-    st.subheader("Current Allocation")
-    fig_pie = px.pie(
-        df[df['Date'] == latest['Date']].groupby('Type')['Value'].sum().reset_index(), 
-        values='Value', names='Type', hole=0.5, 
-        color='Type', color_discrete_map=color_map
-    )
-    fig_pie.update_traces(
-        textfont_color='white', textinfo='percent+label', 
-        insidetextorientation='horizontal', 
-        hovertemplate='%{label}<br>$%{value:,.2f}<br>%{percent}'
-    )
-    fig_pie.update_layout(
-        annotations=[dict(text=f"${latest['Value']:,.2f}", x=0.5, y=0.5, font_size=20, showarrow=False)]
-    )
-    st.plotly_chart(fig_pie, use_container_width=True)
-    
-    with st.expander("View Raw Data"):
-        st.dataframe(df)
+        # 3. Chart: Benchmark Comparison
+        st.subheader(f"Portfolio vs. {bench_key}")
+        st.info(f"Comparing your Active Strategy vs. Passive {bench_key} Index Fund.")
 
-# --- 3. MAIN CONTROLLER ---
+        fig_bench = go.Figure()
+        fig_bench.add_trace(go.Scatter(
+            x=df_total['Date'], y=df_total['BenchValue'], 
+            name=f'{bench_key} ({target_currency})', 
+            line=dict(color=BENCHMARK_ORANGE, width=2), 
+            hovertemplate=f'{bench_key}: '+'$%{y:,.2f}'
+        ))
+        fig_bench.add_trace(go.Scatter(
+            x=df_total['Date'], y=df_total['Value'], 
+            name='My Portfolio', 
+            line=dict(color=PRIMARY_GREEN, width=3), 
+            hovertemplate='My Portfolio: $%{y:,.2f}'
+        ))
+        fig_bench.update_layout(
+            hovermode="x unified", template="plotly_white", height=400, 
+            yaxis_tickprefix="$", yaxis_tickformat=",.2f"
+        )
+        st.plotly_chart(fig_bench, use_container_width=True)
+
+        # 4. Charts: Composition & Returns
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            st.subheader("Portfolio Composition")
+            fig_comp = px.area(
+                df_conv.groupby(['Date', 'Type'])['Value'].sum().reset_index(), 
+                x="Date", y="Value", color="Type", 
+                color_discrete_map=color_map
+            )
+            fig_comp.update_layout(
+                hovermode="x unified", template="plotly_white", 
+                yaxis_tickprefix="$", yaxis_tickformat=",.2f"
+            )
+            fig_comp.update_traces(hovertemplate='$%{y:,.2f}')
+            st.plotly_chart(fig_comp, use_container_width=True)
+
+        with col_b:
+            st.subheader("Monthly Market Gain ($)")
+            df_total['TotalDiff'] = df_total['Value'].diff().fillna(0)
+            df_total['Contribution'] = df_total['BookCost'].diff().fillna(0)
+            df_total['MarketGain'] = df_total['TotalDiff'] - df_total['Contribution']
+            df_total['BarColor'] = df_total['MarketGain'].apply(lambda x: PRIMARY_GREEN if x >= 0 else DANGER_RED)
+            
+            fig_bar = go.Figure(go.Bar(
+                x=df_total['Date'], y=df_total['MarketGain'], 
+                marker_color=df_total['BarColor'], 
+                hovertemplate='Gain: $%{y:,.2f}<extra></extra>'
+            ))
+            fig_bar.update_layout(
+                template="plotly_white", 
+                yaxis_tickprefix="$", yaxis_tickformat=",.2f"
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        # 5. Chart: Allocation Donut
+        st.subheader("Current Allocation")
+        fig_pie = px.pie(
+            df[df['Date'] == latest['Date']].groupby('Type')['Value'].sum().reset_index(),
+            values='Value', names='Type', hole=0.5,
+            color='Type', color_discrete_map=color_map
+        )
+
+        fig_pie.update_traces(
+            textfont_color='white', textinfo='percent+label',
+            insidetextorientation='horizontal',
+            hovertemplate='%{label}<br>$%{value:,.2f}<br>%{percent}'
+        )
+
+        fig_pie.update_layout(
+            annotations=[dict(text=f"${latest['Value']:,.2f}", x=0.5, y=0.5, font_size=20, showarrow=False)]
+        )
+        
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        with st.expander("View Raw Data"):
+            st.dataframe(df_conv)
+
+    # --- TAB 2: SIMULATOR ---
+    with tab2:
+        st.subheader("Monte Carlo Wealth Projection")
+        st.info("This simulation runs 500 possible market scenarios to estimate your future net worth.")
+        
+        # Controls
+        col_input, col_chart = st.columns([1, 3])
+        
+        with col_input:
+            st.markdown("### Parameters")
+            sim_years = st.slider("Years to Grow", 1, 60, 25)
+            sim_contrib = st.number_input(f"Monthly Contribution ({target_currency})", value=2000, step=100)
+            sim_return = st.slider("Exp. Annual Return (%)", 0.0, 50.0, 7.0) / 100
+            sim_vol = st.slider("Volatility (%)", 5.0, 30.0, 15.0) / 100
+            
+            current_nw = latest['Value']
+            st.divider()
+            st.metric("Starting Capital", f"${current_nw:,.2f}")
+        
+        # Run Simulation
+        paths = run_monte_carlo(current_nw, sim_contrib, sim_years, sim_return, sim_vol)
+        
+        # Calculate Percentiles
+        p10 = np.percentile(paths, 10, axis=1)
+        p50 = np.percentile(paths, 50, axis=1)
+        p90 = np.percentile(paths, 90, axis=1)
+        
+        future_dates = pd.date_range(start=latest['Date'], periods=len(p50), freq='ME')
+        
+        # Plotting
+        with col_chart:
+            fig_mc = go.Figure()
+            # 90th Percentile (Optimistic)
+            fig_mc.add_trace(go.Scatter(
+                x=future_dates, y=p90, mode='lines', line=dict(color=BENCHMARK_ORANGE,width=3), name='Upper Bound (90%)', hovertemplate="$%{y:,.0f}"
+            ))
+            # 10th Percentile (Pessimistic) - Fill area
+            fig_mc.add_trace(go.Scatter(
+                x=future_dates, y=p10, mode='lines', line=dict(color= DANGER_RED, width=3), fill='tonexty', fillcolor='rgba(46, 204, 113, 0.2)', name='Lower Bound (10%)', hovertemplate="$%{y:,.0f}"
+            ))
+            # Median
+            fig_mc.add_trace(go.Scatter(
+                x=future_dates, y=p50, mode='lines', line=dict(color=PRIMARY_GREEN, width=3), name='Median Outcome' , hovertemplate="$%{y:,.0f}"
+            ))
+            
+            final_median = p50[-1]
+            fig_mc.update_layout(
+                title=f"Projected Median (In {sim_years} Years): ${final_median:,.2f}", 
+                template="plotly_white", hovermode="x unified", yaxis_tickprefix="$"
+            )
+            st.plotly_chart(fig_mc, use_container_width=True)
+
+# --- 4. MAIN CONTROLLER ---
 
 # Initialize Session State
 if 'demo_active' not in st.session_state:
@@ -301,8 +413,10 @@ if 'uploader_key' not in st.session_state:
 
 st.title("Stacked: Investment Dashboard")
 
+# Initialize FX
+usd_cad_rate = get_exchange_rate()
+
 with st.sidebar:
-    # 1. Data Import (TOP PRIORITY)
     st.header("1. Data Import")
     uploaded_files = st.file_uploader("Upload CSV Files", type="csv", accept_multiple_files=True, key=f"uploader_{st.session_state.uploader_key}")
     
@@ -327,19 +441,24 @@ with st.sidebar:
         
     st.markdown("---")
 
-    # 2. Settings (SECONDARY)
-    st.header("2. Benchmark Settings")
-    bench_choice = st.selectbox("Compare Against:", ["S&P 500", "Nasdaq-100", "TSX Composite (Canada)"])
-    st.caption(BENCHMARK_CONTEXT[bench_choice])
-    bench_map = {"S&P 500": "^GSPC", "Nasdaq-100": "^IXIC", "TSX Composite (Canada)": "^GSPTSE"}
+    # 2. Settings
+    st.header("2. Settings")
+    
+    # Currency Toggle
+    target_currency = st.radio("Display Currency", ["CAD", "USD"], horizontal=True)
+    st.caption(f"Live Rate: 1 USD = {usd_cad_rate:.2f} CAD")
+    
+    # Benchmark Selector
+    bench_choice = st.selectbox("Compare Against:", list(BENCHMARK_CONTEXT.keys()))
+    st.caption(BENCHMARK_CONTEXT[bench_choice]['desc'])
 
 
 # Logic to Switch Data Source
 if st.session_state.demo_active:
     df_to_show = generate_example_data()
-    render_dashboard(df_to_show, bench_map[bench_choice], bench_choice)
+    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate)
 elif uploaded_files:
     df_to_show = parse_data(uploaded_files)
-    render_dashboard(df_to_show, bench_map[bench_choice], bench_choice)
+    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate)
 else:
     st.info("Upload your CSV files to begin, or click 'Load Demo' in the sidebar.")
